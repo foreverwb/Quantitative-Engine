@@ -1,0 +1,9 @@
+{
+  "events": [
+    {
+      "event_type": "fomc",
+      "event_date": "2026-05-07",
+      "description": "FOMC Meeting - May 2026"
+    }
+  ]
+}

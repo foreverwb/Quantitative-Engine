@@ -1,0 +1,48 @@
+strategy_mapping:
+  trend:
+    bullish:
+      - type: bull_call_spread
+        description: "Bull Call Spread"
+      - type: long_call
+        description: "Long Call (进取)"
+      - type: short_put_spread
+        description: "Bull Put Spread"
+    bearish:
+      - type: bear_put_spread
+        description: "Bear Put Spread"
+      - type: long_put
+        description: "Long Put (进取)"
+      - type: short_call_spread
+        description: "Bear Call Spread"
+
+  range:
+    - type: iron_condor
+      description: "Iron Condor"
+    - type: iron_butterfly
+      description: "Iron Butterfly"
+    - type: short_strangle
+      description: "Short Strangle (进取)"
+
+  transition:
+    - type: iron_condor_skewed
+      description: "Skewed Iron Condor"
+    - type: calendar_spread
+      description: "Calendar Spread"
+
+  volatility_mean_reversion:
+    - type: short_straddle
+      description: "Short Straddle"
+    - type: iron_butterfly
+      description: "Iron Butterfly"
+    - type: ratio_spread
+      description: "Ratio Spread"
+
+  event_volatility:
+    pre_event:
+      - type: long_straddle
+        description: "Long Straddle"
+      - type: long_strangle
+        description: "Long Strangle"
+    post_event:
+      - type: short_straddle_protected
+        description: "Short Straddle + Wings"
