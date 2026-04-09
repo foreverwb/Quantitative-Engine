@@ -1,0 +1,30 @@
+meso_api:
+  base_url: "http://127.0.0.1:18000"
+  timeout_seconds: 10
+
+orats:
+  api_token: "${ORATS_API_TOKEN}"
+  base_url: "https://api.orats.io/datav2"
+
+futu:
+  host: "127.0.0.1"
+  port: 11111
+  enabled: false  # 可选，无富途时降级到 ORATS 数据
+
+engine:
+  risk_free_rate: 0.05
+  payoff_num_points: 200
+  payoff_range_pct: 0.15
+  top_n_strategies: 3
+  min_oi: 500
+  max_spread_pct: 0.15
+  max_loss_limit: 50000
+
+monitor:
+  refresh_interval_seconds: 300
+  websocket_spot_interval_seconds: 10
+  websocket_pnl_interval_seconds: 30
+  snapshot_retention_days: 30
+
+database:
+  url: "sqlite:///data/engine.db"

@@ -1,0 +1,61 @@
+tier1_market:
+  spot_drift_pct:
+    yellow: 0.015
+    red: 0.030
+    action: "recalc_from_step_4"
+  atm_iv_drift_pct:
+    yellow: 0.08
+    red: 0.15
+    action: "recalc_from_step_5"
+  zero_gamma_drift_pct:
+    yellow: 0.010
+    red: 0.020
+    action: "recalc_from_step_4"
+  term_structure_flip:
+    red: true
+    action: "recalc_from_step_3"
+  gex_sign_flip:
+    red: true
+    action: "recalc_from_step_4"
+  vol_pcr:
+    yellow_high: 1.0
+    yellow_low: 0.6
+    red_high: 1.2
+    red_low: 0.5
+    action: "recalc_from_step_5"
+
+tier2_analysis:
+  score_drift_max:
+    yellow: 15
+    red: 25
+    action: "recalc_from_step_5"
+  direction_flip:
+    red: true
+    action: "recalc_from_step_5"
+  iv_score_change:
+    yellow: 12
+    red: 20
+    action: "recalc_from_step_6"
+  scenario_invalidation_count:
+    yellow: 1
+    red: 2
+    action: "recalc_from_step_2"
+
+tier3_strategy:
+  max_loss_proximity:
+    yellow: 0.50
+    red: 0.75
+  delta_drift:
+    yellow: 0.15
+    red: 0.30
+  theta_realization_ratio:
+    yellow_low: 0.70
+    red_low: 0.50
+  breakeven_distance_pct:
+    yellow: 0.02
+    red: 0.01
+  dte_remaining:
+    yellow: 5
+    red: 2
+
+refresh_interval_seconds: 300  # 5 分钟
