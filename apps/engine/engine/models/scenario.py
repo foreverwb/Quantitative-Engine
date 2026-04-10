@@ -9,7 +9,16 @@ engine/models/scenario.py — 场景分析结果数据模型
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, ConfigDict
+
+ScenarioLabel = Literal[
+    "trend", "range", "transition",
+    "volatility_mean_reversion", "event_volatility",
+]
+
+AnalysisMethod = Literal["rule_engine", "llm_fallback"]
 
 
 class ScenarioResult(BaseModel):
@@ -17,7 +26,7 @@ class ScenarioResult(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    scenario: str                        # e.g. "trend", "range", "transition", "event", "unknown"
+    scenario: ScenarioLabel              # 场景标签
     confidence: float                    # [0, 1]
-    method: str                          # 使用的分析方法标识
+    method: AnalysisMethod               # 使用的分析方法标识
     invalidate_conditions: list[str]     # 使此场景失效的条件列表
