@@ -100,7 +100,11 @@ class MicroClient:
             MicroSnapshot: 包含原始数据帧 + 衍生计算结果
         """
         # ── Phase 1: 基础调用 (并行) ─────────────────────────────
-        combined_fields = sorted(set(GEX_FIELDS + DEX_FIELDS))
+        combined_fields = sorted(set(
+            GEX_FIELDS + DEX_FIELDS + [
+                "callValue", "putValue", "smvVol", "theta", "vega",
+            ]
+        ))
 
         strikes, monies, summary, ivrank = await asyncio.gather(
             self._provider.get_strikes(

@@ -25,8 +25,8 @@ class StrategyLeg(BaseModel):
     strike: float
     expiry: date
     qty: int = 1
-    premium: float          # mid price
-    iv: float
+    premium: float          # ORATS callValue / putValue
+    iv: float               # ORATS smvVol
     delta: float
     gamma: float
     theta: float
