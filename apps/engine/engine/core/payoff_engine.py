@@ -1,9 +1,10 @@
 """
-engine/core/payoff_engine.py — 期权组合 Payoff 曲线计算引擎
+engine/core/payoff_engine.py — 曲面感知 Payoff 引擎
 
-职责: 基于期权 leg 列表计算到期 Payoff、当前 Payoff (BSM)、最大盈亏、
-      breakeven 点和 Probability of Profit (POP)。纯计算函数无 IO 副作用。
-依赖: math, datetime.date, pydantic, scipy.stats.norm, engine.core.bsm
+职责: 计算策略的到期 payoff（解析解）和当前 payoff（SMV 曲面定价），
+      以及基于 Breeden-Litzenberger 风险中性密度的 POP 估算。
+      纯计算函数无 IO 副作用。
+依赖: math, datetime.date, pydantic, engine.core.pricing
 被依赖: engine.steps.s06_strategy_calculator, engine.steps.s09_payoff
 """
 
@@ -14,9 +15,8 @@ from datetime import date
 from typing import Protocol, Sequence, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict
-from scipy.stats import norm
 
-from engine.core.bsm import bsm_price
+from engine.core.pricing import SMVSurface, bs_formula
 
 # ---------------------------------------------------------------------------
 # 常量
@@ -51,7 +51,6 @@ class PayoffLeg(Protocol):
     expiry: date
     qty: int
     premium: float
-    iv: float
 
 
 class PayoffResult(BaseModel):
@@ -61,7 +60,7 @@ class PayoffResult(BaseModel):
 
     spot_range: list[float]   # X 轴: 标的价格采样点
     expiry_pnl: list[float]   # 到期 P/L (解析解)
-    current_pnl: list[float]  # 当前 P/L (BSM 估值)
+    current_pnl: list[float]  # 当前 P/L (SMV 曲面定价)
     max_profit: float         # 区间内最大盈利
     max_loss: float           # 区间内最大亏损 (通常为负值)
     breakevens: list[float]   # P/L 过零点 (线性插值)
@@ -76,6 +75,7 @@ class PayoffResult(BaseModel):
 def compute_payoff(
     legs: Sequence[PayoffLeg],
     spot: float,
+    smv_surface: SMVSurface,
     risk_free_rate: float = DEFAULT_RISK_FREE_RATE,
     spot_range_pct: float = DEFAULT_SPOT_RANGE_PCT,
     num_points: int = DEFAULT_NUM_POINTS,
@@ -86,7 +86,8 @@ def compute_payoff(
     Args:
         legs: 组合中的期权 leg 列表 (至少一条)
         spot: 标的当前价格
-        risk_free_rate: 年化无风险利率，用于 BSM 当前定价
+        smv_surface: ORATS SMV IV 曲面
+        risk_free_rate: 年化无风险利率
         spot_range_pct: X 轴 spot 浮动范围, [spot*(1-pct), spot*(1+pct)]
         num_points: X 轴采样点数
         as_of_date: 计算当前 payoff 的基准日期，默认 date.today()
@@ -104,20 +105,22 @@ def compute_payoff(
         round(_expiry_pnl_at(price, legs, net_premium), 2) for price in spot_range
     ]
     current_pnl = [
-        round(_current_pnl_at(price, legs, risk_free_rate, as_of), 2)
+        round(_current_pnl_at(price, legs, risk_free_rate, as_of, smv_surface), 2)
         for price in spot_range
     ]
 
     max_profit = max(expiry_pnl)
     max_loss = min(expiry_pnl)
     breakevens = _find_breakevens(spot_range, expiry_pnl)
-    pop = _estimate_pop(
+
+    avg_dte = sum(max((leg.expiry - as_of).days, 1) for leg in legs) / len(legs)
+    pop = _estimate_pop_from_surface(
         spot=spot,
-        legs=legs,
+        smv_surface=smv_surface,
+        dte_days=int(avg_dte),
         risk_free_rate=risk_free_rate,
         spot_range=spot_range,
         expiry_pnl=expiry_pnl,
-        as_of_date=as_of,
     )
 
     return PayoffResult(
@@ -162,10 +165,7 @@ def _build_spot_range(spot: float, pct: float, n: int) -> list[float]:
 
 
 def _net_premium(legs: Sequence[PayoffLeg]) -> float:
-    """组合的初始净 premium。
-
-    sell 为正 (现金流入)，buy 为负 (现金流出)。
-    """
+    """组合的初始净 premium。sell 为正 (现金流入)，buy 为负 (现金流出)。"""
     return sum(
         leg.premium * leg.qty * CONTRACT_MULTIPLIER * (1 if leg.side == "sell" else -1)
         for leg in legs
@@ -196,13 +196,20 @@ def _current_pnl_at(
     legs: Sequence[PayoffLeg],
     risk_free_rate: float,
     as_of: date,
+    smv_surface: SMVSurface,
 ) -> float:
+    """当前 P/L：逐 strike 从 SMV 曲面查询 IV 后用 BS 公式定价。"""
     pnl = 0.0
     for leg in legs:
         dte_days = max((leg.expiry - as_of).days, 1)
-        T = dte_days / DAYS_PER_YEAR
-        current_value = bsm_price(
-            price, leg.strike, T, risk_free_rate, leg.iv, leg.option_type
+        iv_at_strike = smv_surface.get_iv(leg.strike, dte_days, price)
+        current_value = bs_formula(
+            price,
+            leg.strike,
+            dte_days / DAYS_PER_YEAR,
+            risk_free_rate,
+            iv_at_strike,
+            leg.option_type,
         )
         diff = current_value - leg.premium
         sign = 1 if leg.side == "buy" else -1
@@ -229,52 +236,39 @@ def _find_breakevens(
     return breakevens
 
 
-def _estimate_pop(
+def _estimate_pop_from_surface(
     spot: float,
-    legs: Sequence[PayoffLeg],
+    smv_surface: SMVSurface,
+    dte_days: int,
     risk_free_rate: float,
     spot_range: list[float],
     expiry_pnl: list[float],
-    as_of_date: date,
 ) -> float:
-    """用 log-normal 分布近似估算 Probability of Profit。
+    """Breeden-Litzenberger 定理: 风险中性密度 = d^2C/dK^2
 
-    注意: 当盈利区间在 spot_range 之外延伸时，会因区间截断低估 POP。
+    从 SMV 曲面隐含的密度估算 POP，自然包含 skew 和尾部信息。
     """
-    dtes = [max((leg.expiry - as_of_date).days, 1) for leg in legs]
-    avg_dte = sum(dtes) / len(dtes)
-    T = avg_dte / DAYS_PER_YEAR
-    avg_iv = sum(leg.iv for leg in legs) / len(legs)
-    if T <= 0 or avg_iv <= 0:
+    if dte_days <= 0 or len(spot_range) < 3:
         return 0.5
 
-    mu = math.log(spot) + (risk_free_rate - 0.5 * avg_iv ** 2) * T
-    sigma = avg_iv * math.sqrt(T)
+    T = dte_days / DAYS_PER_YEAR
+    dK = spot_range[1] - spot_range[0]
 
-    profit_regions = _collect_profit_regions(spot_range, expiry_pnl)
-    prob = 0.0
-    for lo, hi in profit_regions:
-        p_lo = norm.cdf((math.log(lo) - mu) / sigma) if lo > 0 else 0.0
-        p_hi = norm.cdf((math.log(hi) - mu) / sigma) if hi > 0 else 1.0
-        prob += p_hi - p_lo
-    return max(0.0, min(1.0, prob))
+    call_prices: list[float] = []
+    for K in spot_range:
+        iv = smv_surface.get_iv(K, dte_days, spot)
+        c = bs_formula(spot, K, T, risk_free_rate, iv, "call")
+        call_prices.append(c)
 
+    discount = math.exp(risk_free_rate * T)
+    pop = 0.0
+    for i in range(1, len(call_prices) - 1):
+        d2c = (
+            (call_prices[i + 1] - 2 * call_prices[i] + call_prices[i - 1])
+            / (dK**2)
+        )
+        density = d2c * discount
+        if density > 0 and expiry_pnl[i] > 0:
+            pop += density * dK
 
-def _collect_profit_regions(
-    spot_range: list[float],
-    expiry_pnl: list[float],
-) -> list[tuple[float, float]]:
-    """收集 expiry P/L > 0 的连续区间 [lo, hi]。"""
-    regions: list[tuple[float, float]] = []
-    in_profit = False
-    start: float = 0.0
-    for i, p in enumerate(expiry_pnl):
-        if p > 0 and not in_profit:
-            start = spot_range[i]
-            in_profit = True
-        elif p <= 0 and in_profit:
-            regions.append((start, spot_range[i]))
-            in_profit = False
-    if in_profit:
-        regions.append((start, spot_range[-1]))
-    return regions
+    return max(0.0, min(1.0, pop))
