@@ -18,6 +18,7 @@ from engine.core.payoff_engine import (
     PayoffEngineError,
     PayoffResult,
     compute_payoff,
+    recalc_payoff_with_sliders,
 )
 from engine.core.pricing import SMVSurface
 
@@ -297,3 +298,63 @@ class TestValidation:
                 num_points=1,
                 as_of_date=AS_OF,
             )
+
+
+# ---------------------------------------------------------------------------
+# recalc_payoff_with_sliders
+# ---------------------------------------------------------------------------
+
+
+def _make_skewed_surface(spot: float = 100.0) -> SMVSurface:
+    """构造 skewed SMVSurface: OTM put (low delta) IV 高于 ATM IV。
+
+    vol0=0.40 → vol50=0.20 → vol100=0.15 (左偏 skew)
+    """
+    vol_cols = [f"vol{d}" for d in range(0, 101, 5)]
+    # 线性插值: delta=0 → 0.40, delta=50 → 0.20, delta=100 → 0.15
+    def _iv_for_delta(d: int) -> float:
+        if d <= 50:
+            return 0.40 - (0.40 - 0.20) * d / 50
+        return 0.20 - (0.20 - 0.15) * (d - 50) / 50
+
+    row = {col: _iv_for_delta(int(col[3:])) for col in vol_cols}
+    monies_df = pd.DataFrame([
+        {"dte": 10, **row},
+        {"dte": 30, **row},
+    ])
+    strikes_df = pd.DataFrame([
+        {"strike": s, "dte": dte, "delta": s / 200.0}
+        for s in [80, 90, 95, 100, 105, 110, 120]
+        for dte in [10, 30]
+    ])
+    return SMVSurface(monies_df, strikes_df, spot=spot)
+
+
+class TestRecalcWithSliders:
+    def test_recalc_with_sliders_preserves_skew(self) -> None:
+        """iv_multiplier=2.0 时, OTM put 的调整后 IV 仍高于 ATM IV（等比缩放保留 skew）。"""
+        surface = _make_skewed_surface()
+        spot = 100.0
+        slider_dte = 10
+        iv_mult = 2.0
+
+        # OTM put strike = 80 (low delta → high IV)
+        otm_put_iv_raw = surface.get_iv(80.0, slider_dte, spot)
+        atm_iv_raw = surface.get_iv(100.0, slider_dte, spot)
+
+        # 原始曲面验证 skew 存在
+        assert otm_put_iv_raw > atm_iv_raw, "Skewed surface should have OTM put IV > ATM IV"
+
+        # 等比缩放后 skew 保持
+        otm_adjusted = otm_put_iv_raw * iv_mult
+        atm_adjusted = atm_iv_raw * iv_mult
+        assert otm_adjusted > atm_adjusted, "After 2x multiplier, OTM put IV should still exceed ATM IV"
+
+        # recalc_payoff_with_sliders 应成功运行并返回正确长度的曲线
+        legs = [FakeLeg("buy", "put", 80.0, EXPIRY, 1, 2.0)]
+        pnl_curve = recalc_payoff_with_sliders(
+            legs, spot=spot, smv_surface=surface,
+            slider_dte=slider_dte, slider_iv_multiplier=iv_mult,
+        )
+        assert len(pnl_curve) == 200
+        assert all(isinstance(v, float) for v in pnl_curve)

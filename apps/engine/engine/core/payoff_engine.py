@@ -236,6 +236,56 @@ def _find_breakevens(
     return breakevens
 
 
+def recalc_payoff_with_sliders(
+    legs: Sequence[PayoffLeg],
+    spot: float,
+    smv_surface: SMVSurface,
+    slider_dte: int,
+    slider_iv_multiplier: float,
+    risk_free_rate: float = DEFAULT_RISK_FREE_RATE,
+    spot_range_pct: float = DEFAULT_SPOT_RANGE_PCT,
+    num_points: int = DEFAULT_NUM_POINTS,
+) -> list[float]:
+    """Slider 交互式 payoff 重算。
+
+    slider_iv_multiplier 作用于整张曲面的每个查询结果:
+      adjusted_iv = surface.get_iv(K, T) × multiplier
+    保留 skew 形态（所有 strike 等比缩放）。
+
+    Args:
+        legs: 组合中的期权 leg 列表
+        spot: 标的当前价格
+        smv_surface: ORATS IV 曲面
+        slider_dte: UI 滑块指定的 DTE（天数）
+        slider_iv_multiplier: 曲面整体缩放倍数（保留 skew 形态）
+        risk_free_rate: 年化无风险利率
+        spot_range_pct: X 轴 spot 浮动范围
+        num_points: X 轴采样点数
+
+    Returns:
+        pnl_curve: list[float]，长度 = num_points
+    """
+    spot_range = _build_spot_range(spot, spot_range_pct, num_points)
+    T = max(slider_dte, 0) / DAYS_PER_YEAR
+
+    pnl_curve: list[float] = []
+    for price in spot_range:
+        pnl = 0.0
+        for leg in legs:
+            base_iv = smv_surface.get_iv(leg.strike, slider_dte, price)
+            adjusted_iv = base_iv * slider_iv_multiplier
+            val = bs_formula(
+                price, leg.strike, T, risk_free_rate, adjusted_iv, leg.option_type
+            )
+            if leg.side == "buy":
+                pnl += (val - leg.premium) * leg.qty * CONTRACT_MULTIPLIER
+            else:
+                pnl += (leg.premium - val) * leg.qty * CONTRACT_MULTIPLIER
+        pnl_curve.append(round(pnl, 2))
+
+    return pnl_curve
+
+
 def _estimate_pop_from_surface(
     spot: float,
     smv_surface: SMVSurface,
