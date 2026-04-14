@@ -102,7 +102,12 @@ class MicroClient:
         # ── Phase 1: 基础调用 (并行) ─────────────────────────────
         combined_fields = sorted(set(
             GEX_FIELDS + DEX_FIELDS + [
-                "callValue", "putValue", "smvVol", "theta", "vega",
+                "callValue", "putValue",          # ORATS SMV 理论价
+                "callMidIv", "putMidIv",          # 市场中间 IV
+                "smvVol",                         # SMV 拟合 IV
+                "callBidPrice", "callAskPrice",   # bid/ask
+                "putBidPrice", "putAskPrice",
+                "theta", "vega",                  # 额外 Greeks
             ]
         ))
 
