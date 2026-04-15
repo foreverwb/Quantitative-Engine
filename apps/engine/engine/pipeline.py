@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from engine.models.snapshots import AnalysisResultSnapshot, MarketParameterSnapshot
+from engine.providers.futu_client import FutuClient, LiveQuoteEnricher
 from engine.providers.meso_client import MesoClient
 from engine.providers.micro_client import MicroClient
 from engine.steps import (
@@ -66,6 +67,16 @@ class AnalysisPipeline:
         self._top_n: int = engine_cfg.get("top_n_strategies", 3)
         self._payoff_num_points: int = engine_cfg.get("payoff_num_points", 200)
         self._payoff_range_pct: float = engine_cfg.get("payoff_range_pct", 0.15)
+
+        futu_cfg = config.get("futu", {})
+        self._futu_enabled: bool = futu_cfg.get("enabled", False)
+        self._live_quote_enricher: LiveQuoteEnricher | None = None
+        if self._futu_enabled:
+            futu_client = FutuClient(
+                host=futu_cfg.get("host", "127.0.0.1"),
+                port=futu_cfg.get("port", 11111),
+            )
+            self._live_quote_enricher = LiveQuoteEnricher(futu_client)
 
     async def run_full(
         self,
@@ -172,6 +183,17 @@ class AnalysisPipeline:
         except Exception as exc:
             logger.error("Step 7 (Risk Profiler) failed: %s", exc)
             raise PipelineError(f"Step 7 failed: {exc}") from exc
+
+        # ── Step 8 前置: LiveQuoteEnricher (futu.enabled=true 时) ──
+        if self._live_quote_enricher is not None:
+            try:
+                candidates = self._live_quote_enricher.enrich(
+                    candidates, symbol
+                )
+            except Exception as exc:
+                logger.warning(
+                    "LiveQuoteEnricher failed (degraded, no bid/ask): %s", exc
+                )
 
         # ── Step 8: Strategy Ranker ─────────────────────────────
         try:
