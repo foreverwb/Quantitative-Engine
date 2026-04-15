@@ -9,6 +9,7 @@ engine/main.py — FastAPI 应用入口
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import re
@@ -68,16 +69,27 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     logger.info("Database initialised: %s", db_url)
 
     # Pipeline 实例化并注入路由（延迟导入，避免 compute 模块未安装时启动失败）
+    monitor_loop = None
+    monitor_task = None
     try:
         from engine.pipeline import AnalysisPipeline  # noqa: PLC0415
         pipeline = AnalysisPipeline(config)
         routes_analysis.set_pipeline(pipeline)
         logger.info("AnalysisPipeline initialised")
+
+        # 监控循环初始化
+        monitor_loop, monitor_task = _start_monitor_loop(config, pipeline)
     except ImportError as exc:
         logger.warning("AnalysisPipeline not available (missing deps: %s); "
                        "POST /analysis will return 503", exc)
 
     yield
+
+    # 优雅停止监控循环
+    if monitor_loop is not None and monitor_task is not None:
+        monitor_loop.shutdown()
+        await monitor_task
+        logger.info("MonitorLoop stopped")
 
     logger.info("Engine shutting down")
 
@@ -115,6 +127,51 @@ def create_app() -> FastAPI:
         return {"status": "ok"}
 
     return app
+
+
+def _start_monitor_loop(
+    config: dict[str, Any],
+    pipeline: Any,
+) -> tuple[Any, asyncio.Task[None]]:
+    """创建并启动监控后台循环，返回 (MonitorLoop, Task)。"""
+    from engine.db.session import get_db  # noqa: PLC0415
+    from engine.monitor.alert_engine import AlertEngine  # noqa: PLC0415
+    from engine.monitor.incremental_recalc import IncrementalRecalculator  # noqa: PLC0415
+    from engine.monitor.monitor_loop import MonitorLoop  # noqa: PLC0415
+    from engine.monitor.snapshot_collector import SnapshotCollector  # noqa: PLC0415
+
+    monitor_cfg = config.get("monitor", {})
+    interval = monitor_cfg.get("refresh_interval_seconds", 300)
+
+    # 加载告警阈值配置
+    thresholds_path = Path(__file__).parent / "config" / "thresholds.yaml"
+    thresholds: dict[str, Any] = {}
+    if thresholds_path.exists():
+        raw = thresholds_path.read_text(encoding="utf-8")
+        thresholds = yaml.safe_load(raw) or {}
+
+    # db_session_factory: 每次调用返回一个新 Session
+    from engine.db.session import _SessionLocal  # noqa: PLC0415
+    db_session_factory = _SessionLocal
+
+    collector = SnapshotCollector(
+        micro_client=pipeline._micro_client,
+        db_session=db_session_factory(),
+    )
+    alert_engine = AlertEngine(thresholds_config=thresholds)
+    recalculator = IncrementalRecalculator(pipeline)
+
+    loop = MonitorLoop(
+        refresh_interval=interval,
+        snapshot_collector=collector,
+        alert_engine=alert_engine,
+        recalculator=recalculator,
+        db_session_factory=db_session_factory,
+    )
+
+    task: asyncio.Task[None] = asyncio.create_task(loop.run())
+    logger.info("MonitorLoop started (interval=%ds)", interval)
+    return loop, task
 
 
 app = create_app()
