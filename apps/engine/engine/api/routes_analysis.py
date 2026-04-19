@@ -3,7 +3,7 @@ engine/api/routes_analysis.py — 分析引擎 REST 端点
 
 职责: 提供触发分析、查询分析结果、获取 payoff 数据的 HTTP API。
       路由层只做参数校验和调用编排，业务逻辑委托给 pipeline。
-依赖: engine.pipeline, engine.db.session, engine.db.models
+依赖: engine.pipeline, engine.db.session, engine.db.models, engine.db.persist
 被依赖: engine.main
 """
 
@@ -19,6 +19,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.orm import Session
 
 from engine.db.models import AnalysisResultSnapshotRow, MarketParameterSnapshotRow
+from engine.db.persist import persist_analysis_result
 from engine.db.session import get_db
 
 logger = logging.getLogger(__name__)
@@ -57,39 +58,7 @@ async def run_analysis(
         logger.error("Pipeline failed for %s: %s", symbol, exc)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-    # 持久化 MarketParameterSnapshot
-    mps_row = MarketParameterSnapshotRow(
-        snapshot_id=baseline.snapshot_id,
-        symbol=baseline.symbol,
-        captured_at=baseline.captured_at,
-        data_json=baseline.model_dump_json(),
-    )
-    db.merge(mps_row)
-
-    # 持久化 AnalysisResultSnapshot
-    scores_json = json.dumps(
-        {
-            "gamma_score": result.gamma_score,
-            "break_score": result.break_score,
-            "direction_score": result.direction_score,
-            "iv_score": result.iv_score,
-        }
-    )
-    ars_row = AnalysisResultSnapshotRow(
-        analysis_id=result.analysis_id,
-        symbol=result.symbol,
-        created_at=result.created_at,
-        baseline_snapshot_id=result.baseline_snapshot_id,
-        scores_json=scores_json,
-        scenario=result.scenario,
-        scenario_confidence=result.scenario_confidence,
-        strategies_json=json.dumps(result.strategies, default=str),
-        meso_json=json.dumps(
-            {"s_dir": result.meso_s_dir, "s_vol": result.meso_s_vol}
-        ) if result.meso_s_dir is not None else None,
-    )
-    db.merge(ars_row)
-    db.commit()
+    persist_analysis_result(db, baseline, result)
 
     return {"analysis_id": result.analysis_id}
 
