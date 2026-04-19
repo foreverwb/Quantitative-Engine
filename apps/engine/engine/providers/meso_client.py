@@ -153,6 +153,48 @@ class MesoClient:
                 symbols.append(str(sym))
         return symbols
 
+    async def get_chart_points(self, trade_date: date) -> list[dict]:
+        """
+        调用 GET /api/v1/chart-points?trade_date=YYYY-MM-DD。
+
+        返回原始 chart point 字典列表。404 或空数据时返回空列表。
+        其他 HTTP 错误时抛出 MesoClientError。
+        """
+        url = self._base_url + _CHART_POINTS_PATH
+        params = {"trade_date": trade_date.isoformat()}
+
+        try:
+            async with httpx.AsyncClient(timeout=self._timeout) as client:
+                response = await client.get(url, params=params)
+        except httpx.RequestError as exc:
+            raise MesoClientError(
+                f"Meso API 请求失败 [chart-points]: {exc}"
+            ) from exc
+
+        if response.status_code == 404:
+            logger.debug("Meso chart-points endpoint 返回 404: date=%s", trade_date)
+            return []
+
+        if response.status_code != 200:
+            raise MesoClientError(
+                f"Meso API 返回非预期状态码 {response.status_code}: "
+                f"endpoint=chart-points, date={trade_date}"
+            )
+
+        body = response.json()
+        data = body.get("data") if isinstance(body, dict) else None
+        if not isinstance(data, list):
+            return []
+        return [item for item in data if isinstance(item, dict)]
+
+    async def get_latest_trade_date(self) -> date | None:
+        """
+        调用 GET /api/v1/date-groups?limit=1 获取最近可用交易日。
+
+        返回最近日期，无数据时返回 None。
+        """
+        return await self.get_latest_date()
+
     async def get_latest_date(self) -> date | None:
         """
         调用 GET /api/v1/date-groups?limit=1 获取最近可用日期。
