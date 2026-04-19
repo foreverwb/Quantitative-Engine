@@ -16,6 +16,8 @@
 
 **监控层** 在 FastAPI lifespan 中启动后台 asyncio task（MonitorLoop），每 5 分钟采集市场快照，经三级告警引擎评估后，若触发红色告警则自动从对应 Step 开始增量重算。
 
+**批量分析层** 提供两阶段 CLI 命令（`cli_fetch_symbols` + `cli_run_micro`），支持从 Meso 批量获取当日信号标的，自动触发 Micro-Provider 量化计算。详见第 13 节。
+
 ## 3. 核心设计决策
 
 **Q: 为什么不用 BSM 恒定 IV 定价，而用 SMV 曲面插值？**
@@ -35,6 +37,9 @@ A: 单一 EV 忽略了流动性（低 OI 的 strike 无法实际成交）、tail
 
 **Q: 为什么监控采用增量重算而非全量重跑？**
 A: 全量重跑（Step 2-9）需要多次 ORATS API 调用和 Meso API 调用，耗时数秒。增量重算根据告警类型判断从哪个 Step 开始——例如 spot 偏移 3% 触发 recalc\_from\_step\_4（只重新拉取 micro 数据和后续计算），IV 漂移触发 recalc\_from\_step\_5（只重新分析场景和策略），复用之前已缓存的中间结果。
+
+**Q: 为什么批量分析拆成两个 CLI 命令而非单个？**
+A: 分离数据获取（fetch-symbols）与量化计算（run-micro）有三个好处：（1）解耦——fetch 阶段只依赖 Meso API，run 阶段只依赖 ORATS API 和 Micro-Provider，两者可独立调试；（2）可重放——snapshot 文件是持久化的中间产物，run-micro 可以反复重跑而无需 Meso 在线；（3）配额控制——ORATS API 按调用次数计费，通过 `--max-symbols` 参数控制单次批量的标的数量，避免意外消耗配额。`--auto-run` toggle 参数则覆盖了"一键执行"的快捷场景。
 
 ## 4. 目录结构
 
@@ -57,7 +62,8 @@ apps/engine/
 │   │   ├── strategy.py                # StrategyCandidate, StrategyLeg, GreeksComposite
 │   │   ├── payoff.py                  # PayoffCurve 相关数据模型
 │   │   ├── snapshots.py               # 三层快照模型（Market/Analysis/Monitor）
-│   │   └── alerts.py                  # AlertEvent, AlertSeverity
+│   │   ├── alerts.py                  # AlertEvent, AlertSeverity
+│   │   └── batch_snapshot.py          # FetchSymbolsSnapshot (批量标的快照模型)
 │   ├── steps/
 │   │   ├── __init__.py
 │   │   ├── s02_regime_gating.py       # Regime 门控：构建上下文、决定是否继续
@@ -78,7 +84,7 @@ apps/engine/
 │   │   └── greeks.py                  # 组合 Greeks 线性加总 + P/L 归因分解
 │   ├── providers/
 │   │   ├── __init__.py
-│   │   ├── meso_client.py             # Meso REST API 异步客户端
+│   │   ├── meso_client.py             # Meso REST API 异步客户端（含批量 symbols 获取）
 │   │   ├── micro_client.py            # Micro-Provider 编排（ORATS + GEX/DEX/Term/Skew）
 │   │   └── futu_client.py             # 富途实时报价（可选）+ LiveQuoteEnricher
 │   ├── monitor/
@@ -95,12 +101,19 @@ apps/engine/
 │   └── db/
 │       ├── __init__.py
 │       ├── models.py                  # SQLAlchemy ORM 五张表
-│       └── session.py                 # DB 会话工厂
+│       ├── session.py                 # DB 会话工厂
+│       └── persist.py                 # 分析结果持久化（API 路由和 CLI 共用）
+├── cli_fetch_symbols.py               # CLI 命令 1：批量获取 Meso 信号标的
+├── cli_run_micro.py                   # CLI 命令 2：调用 Micro-Provider 执行量化分析
 ├── alembic/
 │   ├── env.py
 │   └── versions/
 │       └── 5d5e4deb843b_initial_schema.py
 ├── alembic.ini
+├── data/
+│   ├── .gitkeep
+│   └── snapshots/                     # 批量获取快照输出目录
+│       └── .gitkeep
 ├── tests/
 │   ├── conftest.py
 │   ├── fixtures/                      # mock 数据（JSON）
@@ -118,7 +131,9 @@ apps/engine/
 │   ├── test_snapshot_collector.py
 │   ├── test_incremental_recalc.py
 │   ├── test_pipeline.py
-│   └── test_e2e.py
+│   ├── test_e2e.py
+│   ├── test_cli_fetch_symbols.py      # CLI 命令 1 测试
+│   └── test_cli_run_micro.py          # CLI 命令 2 测试
 ├── start.sh                           # 启动脚本（Alembic 迁移 + uvicorn）
 └── pyproject.toml
 ```
@@ -378,6 +393,8 @@ python -m pytest tests/ -v
 | `test_incremental_recalc.py` | `engine/monitor/incremental_recalc.py` |
 | `test_pipeline.py` | `engine/pipeline.py` |
 | `test_e2e.py` | 端到端集成测试（Step 2-9 全流程） |
+| `test_cli_fetch_symbols.py` | `cli_fetch_symbols.py` + `MesoClient` 批量方法 |
+| `test_cli_run_micro.py` | `cli_run_micro.py` + `persist.py` |
 
 ### Mock 策略
 
@@ -387,7 +404,16 @@ python -m pytest tests/ -v
 
 ### 与 Meso (apps/api) 的交互
 
-本系统通过 MesoClient（`engine/providers/meso_client.py`）以 HTTP 方式调用 Meso REST API，主要使用 `GET /api/v1/signals/{symbol}` 获取方向/波动信号。不直接 import Meso 代码，不共享数据库表，不修改 Meso 任何代码。Meso 不可用时降级运行（meso\_signal 为 None，相关评分子项归零）。
+本系统通过 MesoClient（`engine/providers/meso_client.py`）以 HTTP 方式调用 Meso REST API，使用以下端点：
+
+| 端点 | 用途 | 调用方 |
+|------|------|--------|
+| `GET /api/v1/signals/{symbol}` | 获取单标的方向/波动信号 | `MesoClient.get_signal()` → Step 2 |
+| `GET /api/v1/symbols?trade_date=` | 批量获取指定日期的信号标的列表 | `MesoClient.get_symbols()` → CLI 命令 1 |
+| `GET /api/v1/chart-points?trade_date=` | 获取图表数据点（fallback 提取 symbols） | `MesoClient.get_chart_points()` → CLI 命令 1 |
+| `GET /api/v1/date-groups?limit=` | 获取最近交易日（fallback 日期发现） | `MesoClient.get_latest_trade_date()` → CLI 命令 1 |
+
+不直接 import Meso 代码，不共享数据库表，不修改 Meso 任何代码。Meso 不可用时降级运行（meso\_signal 为 None，相关评分子项归零）。
 
 ### 与 Micro-Provider (compute/provider/regime/infra) 的交互
 
@@ -395,4 +421,189 @@ python -m pytest tests/ -v
 
 ### 不修改已有代码
 
-本系统（`apps/engine/`）是新增目录，不修改 `apps/api/`、`compute/`、`provider/`、`regime/`、`infra/` 中的任何已有代码。
+本系统（`apps/engine/`）是新增目录，不修改 `apps/api/`、`compute/`、`provider/`、`regime/`、`infra/` 中的任何已有代码。Micro-Provider 的唯一变更是 `OratsProvider.__init__` 的 `client` 参数从必选改为可选（向后兼容），以支持 Engine 直接实例化而无需外部管理 httpx 客户端生命周期。
+
+## 13. 批量分析 CLI
+
+### 概述
+
+批量分析由两个独立的 CLI 命令组成，实现"从 Meso 发现标的 → 调用 Micro-Provider 执行量化计算"的端到端工作流。两个命令通过 snapshot 文件解耦，支持独立执行或通过 `--auto-run` 参数串联。
+
+```
+┌──────────────────────┐     snapshot.json     ┌──────────────────────┐
+│  cli_fetch_symbols   │ ──────────────────── → │   cli_run_micro      │
+│                      │                        │                      │
+│  Meso API            │                        │  Micro-Provider      │
+│  GET /symbols        │                        │  OratsProvider       │
+│  GET /chart-points   │                        │  compute.*           │
+│  GET /date-groups    │                        │  regime.*            │
+└──────────────────────┘                        └──────────────────────┘
+```
+
+### 命令 1: fetch-symbols
+
+从 Meso API 批量获取指定日期的方向/波动信号标的，生成 snapshot 文件。
+
+```bash
+cd apps/engine
+
+# 获取今日标的（默认）
+python -m cli_fetch_symbols
+
+# 指定日期
+python -m cli_fetch_symbols -d 2026-04-15
+
+# 仅打印不保存
+python -m cli_fetch_symbols -d 2026-04-15 --dry-run
+
+# 获取后自动触发量化分析
+python -m cli_fetch_symbols -d 2026-04-15 --auto-run
+
+# 自定义 Meso API 地址
+python -m cli_fetch_symbols --meso-url http://10.0.0.5:18000
+```
+
+**参数说明：**
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `-d, --date` | 当日 | 交易日期（YYYY-MM-DD） |
+| `--meso-url` | engine.yaml 配置值 | Meso API 基础 URL |
+| `--output-dir` | `data/snapshots/` | Snapshot 输出目录 |
+| `--auto-run` | 关闭 | 获取标的后自动调用 cli\_run\_micro |
+| `--dry-run` | 关闭 | 仅打印标的列表，不保存 snapshot |
+
+**输出示例：**
+
+```
+══════════════════════════════════════════
+MESO Symbol Fetch
+Date: 2026-04-15 (source: meso_symbols)
+Symbols: 25
+══════════════════════════════════════════
+AAPL  AMZN  CRWD  GOOG  IGV   META
+MSFT  NVDA  QQQ   SMH   SPY   TSLA  ...
+══════════════════════════════════════════
+Snapshot saved: data/snapshots/fetch_2026-04-15_a1b2c3d4.json
+```
+
+**Snapshot 文件格式（FetchSymbolsSnapshot）：**
+
+```json
+{
+  "snapshot_id": "a1b2c3d4-...",
+  "trade_date": "2026-04-15",
+  "fetched_at": "2026-04-15T14:30:00Z",
+  "source": "meso_symbols",
+  "meso_base_url": "http://127.0.0.1:18000",
+  "symbols": ["AAPL", "AMZN", "CRWD", "..."],
+  "symbol_count": 25,
+  "chart_points": null
+}
+```
+
+**标的发现 fallback 链：**
+
+1. 尝试 `GET /api/v1/symbols?trade_date=` — 专用轻量端点
+2. 若空，尝试 `GET /api/v1/chart-points?trade_date=` — 提取 unique symbols
+3. 若空，调用 `GET /api/v1/date-groups?limit=1` 获取最近日期，用该日期重试步骤 1-2
+
+### 命令 2: run-micro
+
+读取 snapshot 文件，对每个标的调用 AnalysisPipeline 执行 Step 2-9 量化分析。
+
+```bash
+cd apps/engine
+
+# 标准执行
+python -m cli_run_micro --snapshot data/snapshots/fetch_2026-04-15_a1b2c3d4.json
+
+# 限制标的数量（ORATS 配额控制）
+python -m cli_run_micro --snapshot data/snapshots/fetch_2026-04-15_a1b2c3d4.json --max-symbols 5
+
+# 只运行分析不写数据库
+python -m cli_run_micro --snapshot data/snapshots/fetch_2026-04-15_a1b2c3d4.json --skip-persist
+
+# 覆盖标的列表
+python -m cli_run_micro --snapshot data/snapshots/fetch_2026-04-15_a1b2c3d4.json --symbols AAPL,NVDA,TSLA
+```
+
+**参数说明：**
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--snapshot` | 必填 | Snapshot JSON 文件路径 |
+| `--max-symbols` | 无限制 | 最多处理的标的数量 |
+| `--sequential` | 默认 | 串行执行（异步并行为未来工作） |
+| `--skip-persist` | 关闭 | 仅运行分析，不持久化到数据库 |
+| `--symbols` | 使用 snapshot | 逗号分隔的标的覆盖列表 |
+
+**输出示例：**
+
+```
+[1/25]  Analyzing AAPL...
+[1/25]  AAPL ✓ scenario=trend confidence=0.85 strategies=3  (2.3s)
+[2/25]  Analyzing AMZN...
+[2/25]  AMZN ✓ scenario=range confidence=0.80 strategies=3  (1.8s)
+[3/25]  Analyzing CRWD...
+[3/25]  CRWD ⊘ skipped (regime gate)  (0.4s)
+[4/25]  Analyzing GME...
+[4/25]  GME ✗ PipelineError: Step 6 failed: no valid expiry  (0.6s)
+...
+
+═══════════════════════════════════════
+Micro Analysis Summary
+Snapshot: fetch_2026-04-15_a1b2c3d4.json
+Date: 2026-04-15
+Total: 25 | Success: 22 | Skipped: 1 | Failed: 2
+Elapsed: 47.2s (avg 1.9s/symbol)
+═══════════════════════════════════════
+Failed:
+  GME  — PipelineError: Step 6 failed: no valid expiry
+  RIVN — PipelineError: Step 4 failed: ORATS API timeout
+═══════════════════════════════════════
+```
+
+**前置条件检查：**
+
+run-micro 在启动时执行以下前置条件检查，任一失败则打印明确错误信息并退出（exit code 1）：
+
+1. **Snapshot 文件** — 文件存在且可解析为 FetchSymbolsSnapshot
+2. **Micro-Provider 模块** — `provider.orats`、`compute.exposure.calculator`、`regime.boundary` 可 import
+3. **ORATS API Token** — 环境变量 `ORATS_API_TOKEN` 已设置
+4. **数据库** — SQLite 文件目录可写，`init_db()` 成功
+
+### auto-run 串联模式
+
+当 `cli_fetch_symbols --auto-run` 启用时，命令 1 在成功生成 snapshot 后自动调用命令 2 的 `run_batch()` 函数（进程内调用，非子进程）。等价于手动执行两个命令：
+
+```bash
+# 以下两种方式效果等价
+
+# 方式 1: auto-run
+python -m cli_fetch_symbols -d 2026-04-15 --auto-run
+
+# 方式 2: 手动两步
+python -m cli_fetch_symbols -d 2026-04-15
+python -m cli_run_micro --snapshot data/snapshots/fetch_2026-04-15_a1b2c3d4.json
+```
+
+### 错误处理策略
+
+批量分析的错误处理遵循"单标的失败不阻塞批量"原则：
+
+- **Meso API 不可达**（命令 1）：打印错误信息，exit code 1，不生成 snapshot
+- **Snapshot 为空标的**（命令 1）：三级 fallback 后仍为空，打印提示，exit code 1
+- **Micro-Provider 不可导入**（命令 2）：启动前检查，打印缺失模块名，exit code 1
+- **ORATS Token 缺失**（命令 2）：启动前检查，打印设置指引，exit code 1
+- **单标的 pipeline 失败**（命令 2）：捕获异常，记录到 failures 列表，继续下一个标的
+- **单标的 gate skip**（命令 2）：正常计入 skipped，不视为错误
+- **全部标的失败**（命令 2）：exit code 1；任意一个成功则 exit code 0
+
+### ORATS API 配额注意事项
+
+每个标的的 `pipeline.run_full()` 会触发多次 ORATS API 调用（strikes、monies、summary、ivrank，可能还有 hist\_summary），总计约 4-6 次/标的。批量执行 25 个标的约消耗 100-150 次 API 调用。ORATS 默认限制 1000 req/min（Micro-Provider 的 TokenBucket 限流器设置为 800 req/min 安全余量）。建议：
+
+- 首次使用时通过 `--max-symbols 3` 测试小批量
+- 日常使用无需特别关注（25 标的远低于限流阈值）
+- 大批量（>100 标的）时建议分批执行或增大 TokenBucket 容量
